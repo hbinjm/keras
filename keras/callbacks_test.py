@@ -1407,7 +1407,7 @@ class KerasCallbacksTest(keras_parameterized.TestCase):
           keras.callbacks.ReduceLROnPlateau(
               monitor='val_loss',
               factor=0.1,
-              min_delta=0,
+              min_delta=-0.5,
               patience=1,
               cooldown=5)
       ]

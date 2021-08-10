@@ -16,6 +16,8 @@
 # pylint: disable=redefined-outer-name
 # pylint: disable=redefined-builtin
 # pylint: disable=g-classes-have-attributes
+# pylint: disable=g-bad-import-order
+# pylint: disable=missing-function-docstring
 """Keras backend API."""
 
 import tensorflow.compat.v2 as tf
@@ -24,6 +26,7 @@ import collections
 import itertools
 import json
 import os
+import random
 import sys
 import threading
 import warnings
@@ -1706,6 +1709,127 @@ def identity(x, name=None):
       A tensor of the same shape, type and content.
   """
   return tf.identity(x, name=name)
+
+
+# Global flag to enforce new stateful RNG for RandomGenerator.
+# When this is enabled, for any caller to RandomGenerator without seed,
+# RandomGenerator will use tf.random.get_global_generator to generate the RNG.
+# The legacy behavior is to use stateful tf.random ops when seed is not provided
+_USE_STATEFUL_RNG = False
+
+
+def is_stateful_rng_enabled():
+  return _USE_STATEFUL_RNG
+
+
+def enabled_stateful_rng():
+  global _USE_STATEFUL_RNG
+  _USE_STATEFUL_RNG = True
+
+
+def disable_stateful_rng():
+  global _USE_STATEFUL_RNG
+  _USE_STATEFUL_RNG = False
+
+
+class RandomGenerator:
+  """Random generator that selects appropriate random ops.
+
+  This class contains the logic for legacy stateful random ops, as well as the
+  new stateless random ops with seeds and tf.random.Generator. Any class that
+  relies on RNG (eg initializer, shuffle, dropout) should use this class to
+  handle the transition from legacy RNG to new stateless RNG.
+  """
+
+  def __init__(self, seed=None):
+    super(RandomGenerator, self).__init__()
+    if tf.compat.v1.executing_eagerly_outside_functions():
+      # In the case of V2, we use tf.random.Generator to create all the random
+      # numbers and seeds.
+      if seed is not None:
+        self._generator = tf.random.Generator.from_seed(seed)
+      elif is_stateful_rng_enabled():
+        self._generator = tf.random.get_global_generator().split()[0]
+      else:
+        # We go back to old approach of using stateful op. This case will be
+        # disabled and removed when we flip the flag for _USE_STATEFUL_RNG.
+        self._generator = None
+      self._seed = None
+    else:
+      # In the v1 case, we use stateful op if user didn't provide the seed.
+      # Stateless random ops requires 2-int seed.
+      if seed is not None:
+        self._seed = [seed, 0]
+      else:
+        self._seed = None
+      self._generator = None
+
+  def get_new_seed(self):
+    """Generate a new seed based on the init config."""
+    if self._generator:
+      return self._generator.make_seeds()[:, 0]
+    elif self._seed:
+      seed = self._seed
+      self._seed[0] += 1
+      return seed
+    else:
+      # Create a seed from numpy. Note that this case should be deprecated and
+      # removed when we flip _USE_STATEFUL_RNG.
+      return [random.randint(0, 1e9), 0]
+
+  def _run_random_op(self, kwargs, generator_op, stateless_op,
+                     legacy_stateful_op):
+    if self._generator:
+      return generator_op(**kwargs)
+    elif self._seed:
+      kwargs['seed'] = self.get_new_seed()
+      return stateless_op(**kwargs)
+    else:
+      return legacy_stateful_op(**kwargs)
+
+  def random_normal(self, shape, mean=0., stddev=1., dtype=None):
+    kwargs = {'shape': shape,
+              'mean': mean,
+              'stddev': stddev,
+              'dtype': dtype or floatx()}
+    return self._run_random_op(
+        kwargs,
+        generator_op=
+        lambda *args, **kwargs: self._generator.normal(*args, **kwargs),    # pylint: disable=unnecessary-lambda
+        stateless_op=tf.random.stateless_normal,
+        legacy_stateful_op=tf.random.normal)
+
+  def random_uniform(self, shape, minval=0., maxval=None, dtype=None):
+    kwargs = {'shape': shape,
+              'minval': minval,
+              'maxval': maxval,
+              'dtype': dtype or floatx()}
+    return self._run_random_op(
+        kwargs,
+        generator_op=
+        lambda *args, **kwargs: self._generator.uniform(*args, **kwargs),  # pylint: disable=unnecessary-lambda
+        stateless_op=tf.random.stateless_uniform,
+        legacy_stateful_op=tf.random.uniform)
+
+  def truncated_normal(self, shape, mean=0., stddev=1., dtype=None):
+    kwargs = {'shape': shape,
+              'mean': mean,
+              'stddev': stddev,
+              'dtype': dtype}
+    return self._run_random_op(
+        kwargs,
+        generator_op=
+        lambda *args, **kwargs: self._generator.truncated_normal(*args,    # pylint: disable=unnecessary-lambda,g-long-lambda
+                                                                 **kwargs),
+        stateless_op=tf.random.stateless_truncated_normal,
+        legacy_stateful_op=tf.random.truncated_normal)
+
+  def dropout(self, inputs, rate, noise_shape=None):
+    if self._generator or self._seed:
+      return tf.nn.experimental.stateless_dropout(
+          inputs, rate=rate, noise_shape=noise_shape, seed=self.get_new_seed())
+    else:
+      return tf.nn.dropout(inputs, rate=rate, noise_shape=noise_shape)
 
 
 @keras_export('keras.backend.random_uniform_variable')
